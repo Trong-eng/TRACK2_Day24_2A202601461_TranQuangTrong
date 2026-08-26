@@ -65,6 +65,24 @@ def read_customer(customer_id: str, customers_file: Path | None = None) -> dict:
     raise ToolError(f"unknown customer_id: {customer_id}")
 
 
+def delete_customer(customer_id: str, customers_file: Path | None = None) -> bool:
+    """Xóa 1 chủ thể dữ liệu (Right to Erasure theo Luật 91/2025).
+
+    Xóa hoàn toàn bản ghi khỏi kho dữ liệu customers_file.
+    Raise ToolError nếu không tìm thấy customer_id.
+    """
+    customers_file = customers_file or CUSTOMERS_FILE
+    customers = json.loads(customers_file.read_text(encoding="utf-8"))
+    initial_count = len(customers)
+    filtered_customers = [c for c in customers if str(c["customer_id"]) != str(customer_id)]
+
+    if len(filtered_customers) == initial_count:
+        raise ToolError(f"unknown customer_id: {customer_id}")
+
+    customers_file.write_text(json.dumps(filtered_customers, ensure_ascii=False, indent=2), encoding="utf-8")
+    return True
+
+
 def http_post(url: str, body: dict, timeout: float = 5.0) -> dict:
     """Chân 3: exfil vector.
 
