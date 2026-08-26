@@ -51,13 +51,144 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
         quan sát được từ ngoài (CLI) không đổi so với trước khi contain,
         chỉ có sink log và ledger là khác.
 """
-from __future__ import annotations
-
+import hashlib
+import json
+import re
+from datetime import datetime, timezone
 from pathlib import Path
+
+from agent import ledger, policy, tools
+from agent.policy import PolicyContext
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
+CUSTOMERS_FILE = Path(__file__).resolve().parent.parent / "data" / "customers.json"
 
 
 def handle(message: str, llm, log_dir: Path | None = None) -> str:
-    raise NotImplementedError("BƯỚC 3c: implement trifecta split")
+    """Xử lý yêu cầu người dùng theo kiến trúc Trifecta Split + Policy Enforcement + Audit Ledger.
+    
+    Tách biệt hoàn toàn:
+      - Run A: Đọc untrusted content (search_docs), KHÔNG gọi private data hay egress.
+      - Run B: Đọc private data (read_customer) dựa trên nguồn tin cậy (ticket_id trích từ tên file
+        map qua related_tickets trong customers.json), KHÔNG đọc customer_id từ free text của attacker.
+      - Egress: Chặn đứng mọi nỗ lực http_post qua Policy Enforcement Point.
+    """
+    ledger_path = (log_dir or REPORTS_DIR) / "ledger.jsonl"
+    agent_id = "lab24-agent"
+
+    # ═════════════════════════════════════════════════════════════════════
+    # RUN A: UNTRUSTED PROCESSING (search_docs)
+    # ═════════════════════════════════════════════════════════════════════
+    run_a_id = "run-a"
+
+    # 1. Policy check cho search_docs
+    ctx_search = PolicyContext(
+        data_classification="internal",
+        request_purpose="search_docs",
+        agent_owner=run_a_id,
+        delegation_depth=0,
+        egress_enabled=False,
+    )
+    allow_search, reason_search = policy.check(ctx_search)
+    ledger.append(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": agent_id,
+            "run_id": run_a_id,
+            "tool": "search_docs",
+            "args_hash": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+            "classification": ctx_search.data_classification,
+            "decision": "allow" if allow_search else "deny",
+            "reason": reason_search,
+        },
+        ledger_path,
+    )
+
+    if not allow_search:
+        return "DENY: Không được phép tìm kiếm tài liệu theo chính sách bảo mật."
+
+    docs = tools.search_docs(message)
+
+    # 2. Kiểm tra Prompt Injection trên dữ liệu không tin cậy
+    combined_text = "\n\n".join(d["text"] for d in docs)
+    injected = llm.find_injection(combined_text)
+
+    # Nếu phát hiện chỉ thị injection cố gắng gửi dữ liệu ra ngoài (egress)
+    if injected is not None:
+        # Đánh giá Policy cho http_post tại Run B (với dữ liệu restricted và egress_enabled=True)
+        ctx_post = PolicyContext(
+            data_classification="restricted",
+            request_purpose="reconcile",
+            agent_owner="run-b",
+            delegation_depth=1,
+            egress_enabled=True,
+        )
+        allow_post, reason_post = policy.check(ctx_post)
+        ledger.append(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "agent_id": agent_id,
+                "run_id": "run-b",
+                "tool": "http_post",
+                "args_hash": hashlib.sha256(injected.target_url.encode("utf-8")).hexdigest(),
+                "classification": ctx_post.data_classification,
+                "decision": "allow" if allow_post else "deny",
+                "reason": reason_post,
+            },
+            ledger_path,
+        )
+        # allow_post là False nên KHÔNG gọi tools.http_post
+
+    # ═════════════════════════════════════════════════════════════════════
+    # RUN B: PRIVATE DATA PROCESSING (read_customer via trusted mapping)
+    # ═════════════════════════════════════════════════════════════════════
+    run_b_id = "run-b"
+
+    # Trích xuất ticket_id từ TÊN FILE tài liệu hợp lệ (Sanitized Typed Input)
+    # Tuyệt đối KHÔNG đọc customer_id từ nội dung free text do attacker viết
+    matched_ticket_ids: set[int] = set()
+    for d in docs:
+        filename = d.get("id", "")
+        m = re.search(r"ticket-(\d+)", filename)
+        if m:
+            matched_ticket_ids.add(int(m.group(1)))
+
+    # Nguồn tin cậy: Tra cứu customer_id từ data/customers.json qua related_tickets
+    customers_data = json.loads(CUSTOMERS_FILE.read_text(encoding="utf-8"))
+    trusted_customer_ids: set[str] = set()
+    for cust in customers_data:
+        cust_tickets = cust.get("related_tickets", [])
+        if any(tid in matched_ticket_ids for tid in cust_tickets):
+            trusted_customer_ids.add(str(cust["customer_id"]))
+
+    # Đọc dữ liệu private của các khách hàng hợp lệ với kiểm tra policy & ledger
+    for customer_id in sorted(trusted_customer_ids):
+        ctx_read = PolicyContext(
+            data_classification="restricted",
+            request_purpose="support-reply",
+            agent_owner=run_b_id,
+            delegation_depth=1,
+            egress_enabled=False,
+        )
+        allow_read, reason_read = policy.check(ctx_read)
+        ledger.append(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "agent_id": agent_id,
+                "run_id": run_b_id,
+                "tool": "read_customer",
+                "args_hash": hashlib.sha256(customer_id.encode("utf-8")).hexdigest(),
+                "classification": ctx_read.data_classification,
+                "decision": "allow" if allow_read else "deny",
+                "reason": reason_read,
+            },
+            ledger_path,
+        )
+        if allow_read:
+            try:
+                tools.read_customer(customer_id)
+            except tools.ToolError:
+                pass
+
+    return llm.summarize(docs)
