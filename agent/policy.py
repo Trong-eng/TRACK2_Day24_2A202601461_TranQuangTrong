@@ -37,4 +37,23 @@ class PolicyContext:
 
 
 def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+    """Kiểm tra quyền thực thi dựa trên PolicyContext.
+    
+    Quy tắc tối thiểu bắt buộc:
+    - classification == 'restricted' and egress_enabled is True -> DENY
+    - Mọi quyết định (allow hay deny) đều phải có lý do (reason) không được rỗng.
+    """
+    # Rule 1: Chặn tuyệt đối việc truy cập hoặc truyền dữ liệu restricted ra ngoài mạng (egress)
+    if context.data_classification == "restricted" and context.egress_enabled:
+        return False, "DENY: Truy cập dữ liệu restricted với quyền egress ra ngoài mạng bị nghiêm cấm theo chính sách bảo mật."
+
+    # Rule 2: Cho phép đọc dữ liệu restricted khi chạy trong môi trường cô lập nội bộ (không egress)
+    if context.data_classification == "restricted" and not context.egress_enabled:
+        return True, f"ALLOW: Cho phép truy cập dữ liệu restricted cho mục đích nội bộ '{context.request_purpose}' của agent '{context.agent_owner}'."
+
+    # Rule 3: Cho phép truy cập dữ liệu public và internal
+    if context.data_classification in ("public", "internal"):
+        return True, f"ALLOW: Cho phép truy cập dữ liệu {context.data_classification} cho mục đích '{context.request_purpose}'."
+
+    # Fallback mặc định
+    return False, f"DENY: Phân loại dữ liệu không xác định '{context.data_classification}'."
